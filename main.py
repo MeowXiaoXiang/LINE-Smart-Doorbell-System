@@ -3,35 +3,46 @@ import cv2
 import threading
 import time
 import json
-import RPi.GPIO as GPIO # 若是樹梅派要使用的話請移除註解 "#" 
+import atexit
 import secrets
 import datetime
 import numpy as np
+import sounddevice as sd
 from loguru import logger
 from flask import Flask, render_template, Response, request, send_from_directory
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import MessageEvent, TextMessage
 from linebot.models import ButtonsTemplate, ConfirmTemplate, MessageAction, TemplateSendMessage
-secret_data = json.load(open('data.json'))
+secret_data = json.load(open('secret.json'))
 # ---------------------可調整區域----------------------
-I2C_OLED = False           # 是否啟用OLED，未開啟會在終端機出現
+I2C_OLED = True            # 是否啟用OLED，未開啟會在終端機出現
 gpio_enable = True         # 啟用GPIO
-base_url = 'https://c20a-120-124-133-202.ngrok-free.app/'
+base_url = 'https://private-resource.example.com'
 line_bot_api = LineBotApi(secret_data['CHANNEL_ACCESS_TOKEN']) # YOUR_CHANNEL_ACCESS_TOKEN
 handler = WebhookHandler(secret_data['CHANNEL_SECRET']) # YOUR_CHANNEL_SECRET
 userID = secret_data['USER_ID'] # 使用者ID
-# ------GPIO伺服馬達輸出設定區域 (樹梅派)----------------
+# ------------------GPIO 初始化------------------------
+if gpio_enable:
+    import RPi.GPIO as GPIO
+    GPIO.setmode(GPIO.BCM)   # GPIO模式
+    # 伺服馬達部分
+    motorPin = 18 # 腳位 18
+    GPIO.setup(motorPin, GPIO.OUT) # 輸出腳位OUT
+    # 蜂鳴器部分
+    BeepPin = 17 # 腳位 17
+    GPIO.setup(BeepPin, GPIO.OUT) # 輸出腳位OUT
+    # 門鈴部分
+    button_pin = 25
+    GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
+# ----------GPIO伺服馬達輸出設定區域 (樹梅派)------------
 def operate_motor(status: str, freq: int = 50) -> None:
     """
     控制伺服馬達開關，可調整裡面的degrees來決定動作。
     :param status: str，馬達狀態，可選值為 "open" 或 "close"。
     :param freq: int，伺服馬達頻率控制，預設50。
     """
-    if gpio_enable:
-        motorPin = 18            # 腳位 18
-        GPIO.setmode(GPIO.BCM)   # GPIO模式
-        GPIO.setup(motorPin, GPIO.OUT) # 輸出腳位OUT
+    if gpio_enable:        
         SG90 = GPIO.PWM(motorPin, freq)  # 建立實體物件, 腳位, 頻率
         SG90.start(0)            # 開始
 
@@ -56,7 +67,6 @@ def operate_motor(status: str, freq: int = 50) -> None:
             move(degree, wait_time=0.35)
 
         SG90.stop()
-        GPIO.cleanup()
     else:
         if status == "open":
             print("門打開")
@@ -71,7 +81,31 @@ if I2C_OLED:
     from luma.oled.device import ssd1306, ssd1325, ssd1331, sh1106
     serial = i2c(port=1, address=0x3C)
     device = ssd1306(serial)
-# ---------------------------------------------------
+# -------------------- OLED控制 ----------------------
+oled_cache = [] # OLED 的暫存
+def oled_control(text_list):
+    """
+    更新OLED顯示，使用新的字串list。
+    :param text_list: list，包含2行要在OLED上顯示的字串。 [第一行, 第二行]
+    """
+    global oled_cache
+    if oled_cache != text_list:
+        oled_cache = text_list
+        try:
+            if I2C_OLED:
+                device.cleanup = ""
+                with canvas(device) as draw:
+                    draw.rectangle(device.bounding_box, outline="white", fill="black")
+                    if len(text_list[0]) < 15:
+                        draw.text((30, 20), F"{text_list[0]}\n{text_list[1]}", fill="white")
+                    else:
+                        draw.text((20, 20), F"{text_list[0]}\n{text_list[1]}", fill="white")
+            else:
+                for index in range(2):
+                    logger.debug(F"OLED 正在顯示: {text_list[index]}")
+        except Exception as e:
+            logger.error(F"OLED顯示發生錯誤: {e}")
+# --------------------------------------------------------
 app = Flask(__name__)
 frame_lock = threading.Lock()  # 用於控制串流生成函數的同步
 latest_image_filename = None
@@ -105,25 +139,11 @@ def is_preview_agent(user_agent):
 
 def generate_frames():
     camera = cv2.VideoCapture(0)  # 使用預設攝影機
-    # 手機屏幕寬度和高度
-    phone_width = 1280
-    phone_height = 720
-    
-    # 圖像的目標寬度
-    target_width = 640
     while True:
         success, frame = camera.read()
         if not success:
             break
         else:
-            # 影像旋轉
-            #frame = cv2.rotate(frame, cv2.ROTATE_90_CLOCKWISE)  # 按順時針方向旋轉90度
-            # 調整畫面尺寸為適合手機的大小
-            # target_height = int(target_width * phone_height / phone_width)
-            
-            # # 調整圖像大小
-            # frame = cv2.resize(frame, (target_width, target_height))
-                        
             ret, buffer = cv2.imencode('.jpg', frame)
             frame = buffer.tobytes()
             with frame_lock:
@@ -148,8 +168,7 @@ def webcam():
             return render_template("401.html"), 401  # 返回自定義的 401 錯誤頁面
     elif is_preview_agent(user_agent):
         return "Access Denied: Preview agents are not allowed", 403
-# ---------------------------------------------------
-
+# ----------------LINE Bot 連接部分-------------------------------
 @app.route('/line_webhook', methods=['POST'])
 def line_webhook():
     # 獲取 LINE Bot 的請求頭部資訊
@@ -164,9 +183,9 @@ def line_webhook():
     except InvalidSignatureError:
         # 簽章驗證失敗，回傳 400 錯誤
         return 'Invalid signature', 400
-    
+    logger.info("LINE Webhook received")
     return 'OK', 200
-
+# --------------圖片抓取區域-----------------------------------------
 @app.route('/image/<filename>')
 def get_image(filename):
     # 指定圖片資料夾的路徑
@@ -190,7 +209,7 @@ def handle_message(event):
     if message == '!DOOR_ACTION':
         # 建立 ConfirmTemplate 物件，設定按鈕樣式和兩個按鈕選項
         confirm_template = ConfirmTemplate(
-            text='門鎖動作',
+            text='門鎖控制選單',
             actions=[
                 MessageAction(label='開門', text='!DOOR_OPEN'),
                 MessageAction(label='關門', text='!DOOR_CLOSE')
@@ -204,10 +223,15 @@ def handle_message(event):
         line_bot_api.reply_message(event.reply_token, template_message)
     elif message == '!DOOR_OPEN':
         operate_motor("open")
+        oled_control(['Door Status:', "Open"])
+        logger.debug("門打開了")
     elif message == '!DOOR_CLOSE':
         operate_motor("close")
+        oled_control(['Door Status:', "Close"])
+        logger.debug("門關閉了")
     elif message == '!TEST':
         push_doorbell_notification()
+        logger.debug("測試訊息發送")
 
 def capture_image():
     global latest_image_filename
@@ -230,10 +254,9 @@ def capture_image():
     camera.release()
 
 def push_doorbell_notification():
+    logger.info("門鈴被按下了")
     global latest_image_filename  # 使用 global 關鍵字聲明全域變數
-
     token = generate_token()
-
     # 拍照並儲存圖片
     capture_image()
 
@@ -241,13 +264,12 @@ def push_doorbell_notification():
     image_url = None
     if latest_image_filename:
         image_url = f'{base_url}/image/{latest_image_filename}'
-
+        
     buttons_template = ButtonsTemplate(
         title='偵測到有人按下門鈴！',
         text='請選擇以下動作：',
         thumbnail_image_url=image_url,  # 縮圖圖片的 URL
         actions=[
-            MessageAction(label='門鎖動作', text='!DOOR_ACTION'),
             MessageAction(label='查看攝影機頁面', text=f'{base_url}/webcam?token={token}')
         ]
     )
@@ -261,15 +283,23 @@ def push_doorbell_notification():
 
     # 清除最新圖片檔名
     latest_image_filename = None
-
+    
 if gpio_enable:
-    def button_callback(channel):
-        print("按鈕被按下！")
+    # piano = [262,294,330,349,392,440,494,524,588,660,698,784,880,988,1048,1176,1320,1396,1568,1760,1976]
+    def play(pitch, sec):
+        half_pitch = (1 / pitch) / 2
+        t = int(pitch * sec)
+        for i in range(t):
+            GPIO.output(17, GPIO.HIGH)
+            time.sleep(half_pitch)
+            GPIO.output(17, GPIO.LOW)
+            time.sleep(half_pitch)
+    def doorbell_callback(channel):
+        logger.info("門鈴按鈕被按下！")
+        # for p in piano:
+        play(988, 1)
         push_doorbell_notification()
-    button_pin = 25
-    GPIO.setmode(GPIO.BCM)
-    GPIO.setup(button_pin, GPIO.IN, pull_up_down=GPIO.PUD_UP)
-    GPIO.add_event_detect(button_pin, GPIO.FALLING, callback=push_doorbell_notification, bouncetime=200)
+    GPIO.add_event_detect(button_pin, GPIO.FALLING, callback=doorbell_callback, bouncetime=1000)
 
 def set_logger(): # log系統
     log_format = (
@@ -286,7 +316,13 @@ def set_logger(): # log系統
         format=log_format
     )
 
-if __name__ == '__main__':
-    set_logger()
-    app.run(host='0.0.0.0',port=8080) # 啟動Flask
+def cleanup():
+    GPIO.cleanup()
 
+if __name__ == '__main__':
+    if gpio_enable:
+        atexit.register(cleanup)
+    set_logger()
+    operate_motor("close")
+    oled_control(['Door Status:', "Close"])
+    app.run(host='0.0.0.0',port=8080) # 啟動Flask
